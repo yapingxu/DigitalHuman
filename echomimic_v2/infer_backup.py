@@ -1,0 +1,408 @@
+# EchoMimic V2 优化版推理脚本 - RTX 4000 Ada 12GB 专用
+# 优化目标：5秒音频2-3分钟完成，避免15分钟超时
+
+import os
+import sys
+import argparse
+import yaml
+import torch
+import torch.nn as nn
+from pathlib import Path
+import time
+import gc
+import psutil
+from contextlib import contextmanager
+
+# ==================== GPU 内存优化配置 ====================
+# 必须在导入其他模块前设置
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,garbage_collection_threshold:0.6'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'  # 生产环境设为0
+os.environ['PYTORCH_CUDA_ALLOC_SYNC'] = '1'  # 同步内存分配
+
+# GPU内存分配优化
+if torch.cuda.is_available():
+    torch.cuda.set_per_process_memory_fraction(0.75)  # 降低到75%给系统留更多空间
+    torch.cuda.empty_cache()
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.allow_tf32 = True  # 启用TF32加速
+    print(f"🚀 GPU优化已启用: {torch.cuda.get_device_name()}")
+    print(f"💾 GPU内存: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f}GB")
+
+# 导入项目模块
+sys.path.append(str(Path(__file__).parent))
+from src.models.unet import UNet3DConditionModel
+from src.pipelines.pipeline_echomimic import EchoMimicPipeline
+from src.utils.util import save_videos_grid
+from src.utils.audio_processor import AudioProcessor
+
+@contextmanager
+def gpu_memory_manager():
+    """GPU内存管理上下文管理器"""
+    torch.cuda.empty_cache()
+    gc.collect()
+    yield
+    torch.cuda.empty_cache()
+    gc.collect()
+
+def print_system_info():
+    """打印系统资源信息"""
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory/1024**3
+        gpu_allocated = torch.cuda.memory_allocated() / 1024**3
+        gpu_cached = torch.cuda.memory_reserved() / 1024**3
+        print(f"🖥️ GPU: {torch.cuda.get_device_name()}")
+        print(f"💾 GPU内存: 总计{gpu_memory:.1f}GB, 已用{gpu_allocated:.2f}GB, 缓存{gpu_cached:.2f}GB")
+    
+    cpu_percent = psutil.cpu_percent()
+    ram = psutil.virtual_memory()
+    print(f"🔧 CPU使用率: {cpu_percent:.1f}%")
+    print(f"🧠 RAM: {ram.used/1024**3:.1f}GB / {ram.total/1024**3:.1f}GB ({ram.percent:.1f}%)")
+
+def print_gpu_memory(stage=""):
+    """打印GPU内存使用情况"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        cached = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"📊 {stage} - GPU内存: 已用{allocated:.2f}GB, 缓存{cached:.2f}GB, 峰值{max_allocated:.2f}GB")
+
+def load_config(config_path):
+    """加载配置文件"""
+    if not Path(config_path).exists():
+        raise FileNotFoundError(f"配置文件不存在: {config_path}")
+    
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    return config
+
+def initialize_pipeline(config):
+    """初始化优化的推理管道"""
+    print("🔧 初始化推理管道...")
+    print_gpu_memory("管道初始化前")
+    
+    # 模型路径
+    model_path = config.get('model_path', './pretrained_weights')
+    
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"模型路径不存在: {model_path}")
+    
+    try:
+        with gpu_memory_manager():
+            # 使用优化的模型加载参数
+            pipe = EchoMimicPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,  # 半精度节省显存
+                variant="fp16",
+                low_cpu_mem_usage=True,     # 减少CPU内存使用
+                use_safetensors=True,
+                device_map="auto"           # 自动设备映射
+            )
+            
+            # 移动到GPU
+            pipe = pipe.to("cuda", torch.float16)
+            
+            # 启用关键优化
+            pipe.enable_vae_slicing()              # VAE切片减少显存
+            pipe.enable_vae_tiling()               # VAE分块处理
+            pipe.enable_attention_slicing("auto")  # 注意力切片
+            pipe.enable_model_cpu_offload()        # 模型CPU卸载
+            
+            # 启用xFormers优化（如果可用）
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                print("✅ xFormers内存优化已启用")
+            except Exception as e:
+                print(f"⚠️ xFormers不可用: {e}")
+            
+            # 编译优化（可选，首次运行会较慢）
+            if config.get('use_torch_compile', False):
+                print("🔥 启用Torch编译优化...")
+                pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead")
+        
+        print("✅ 推理管道初始化完成")
+        print_gpu_memory("管道初始化后")
+        
+        return pipe
+        
+    except Exception as e:
+        print(f"❌ 管道初始化失败: {e}")
+        raise
+
+def get_audio_duration(audio_path):
+    """获取音频时长"""
+    try:
+        import librosa
+        audio, sr = librosa.load(audio_path, sr=None)
+        duration = len(audio) / sr
+        print(f"🎵 音频信息: {duration:.1f}秒, {sr}Hz")
+        return duration
+    except ImportError:
+        print("⚠️ librosa未安装，使用备用方法...")
+        try:
+            import wave
+            with wave.open(audio_path, 'rb') as wav_file:
+                frames = wav_file.getnframes()
+                sample_rate = wav_file.getframerate()
+                duration = frames / float(sample_rate)
+                print(f"🎵 音频信息: {duration:.1f}秒, {sample_rate}Hz")
+                return duration
+        except Exception as e:
+            print(f"⚠️ 无法获取音频长度: {e}")
+            return 5.0
+    except Exception as e:
+        print(f"⚠️ 音频读取失败，使用默认时长: {e}")
+        return 5.0
+
+def optimize_inference_params(audio_duration, gpu_memory_gb=12):
+    """根据音频长度和GPU内存优化推理参数"""
+    
+    # 根据可用GPU内存调整基础参数
+    memory_factor = min(gpu_memory_gb / 12, 1.0)  # 以12GB为基准
+    
+    # RTX 4000 Ada 12GB 优化参数
+    if audio_duration <= 3:
+        # 超短音频（≤3秒）- 可以用更高质量
+        params = {
+            "video_length": int(20 * memory_factor),
+            "num_inference_steps": int(25 * memory_factor),
+            "guidance_scale": 2.5,
+            "height": 512,
+            "width": 512,
+        }
+    elif audio_duration <= 5:
+        # 短音频（3-5秒）- 平衡质量和速度
+        params = {
+            "video_length": int(16 * memory_factor),
+            "num_inference_steps": int(20 * memory_factor),
+            "guidance_scale": 2.0,
+            "height": 512,
+            "width": 512,
+        }
+    elif audio_duration <= 10:
+        # 中等长度（5-10秒）
+        params = {
+            "video_length": int(14 * memory_factor),
+            "num_inference_steps": int(18 * memory_factor),
+            "guidance_scale": 1.8,
+            "height": 512,
+            "width": 512,
+        }
+    else:
+        # 长音频（>10秒） - 更激进优化
+        params = {
+            "video_length": int(12 * memory_factor),
+            "num_inference_steps": int(15 * memory_factor),
+            "guidance_scale": 1.5,
+            "height": 384,  # 中等分辨率
+            "width": 384,
+        }
+    
+    # 确保最小值
+    params["video_length"] = max(params["video_length"], 8)
+    params["num_inference_steps"] = max(params["num_inference_steps"], 10)
+    
+    print(f"🎯 音频长度{audio_duration:.1f}s, GPU内存{gpu_memory_gb}GB, 优化参数:")
+    for key, value in params.items():
+        print(f"   {key}: {value}")
+    
+    return params
+
+def validate_inputs(config):
+    """验证输入文件"""
+    ref_image_path = config.get('reference_image')
+    audio_path = config.get('audio_path')
+    pose_dir = config.get('pose_dir')
+    
+    if not all([ref_image_path, audio_path, pose_dir]):
+        raise ValueError("❌ 配置文件缺少必要参数: reference_image, audio_path, pose_dir")
+    
+    # 检查文件存在性
+    for path, name in [(ref_image_path, "参考图像"), (audio_path, "音频文件"), (pose_dir, "姿势目录")]:
+        if not Path(path).exists():
+            raise FileNotFoundError(f"❌ {name}不存在: {path}")
+    
+    return ref_image_path, audio_path, pose_dir
+
+def run_inference(pipe, config):
+    """执行优化的推理过程"""
+    
+    # 验证输入
+    ref_image_path, audio_path, pose_dir = validate_inputs(config)
+    
+    # 创建输出目录
+    output_dir = Path(config.get('output_dir', './outputs'))
+    output_dir.mkdir(exist_ok=True)
+    
+    # 获取音频长度
+    audio_duration = get_audio_duration(audio_path)
+    
+    # 获取GPU内存信息
+    gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    
+    # 优化推理参数
+    infer_params = optimize_inference_params(audio_duration, gpu_memory_gb)
+    
+    print("🎬 开始生成视频...")
+    print_gpu_memory("推理开始前")
+    
+    start_time = time.time()
+    max_retries = 2
+    
+    for attempt in range(max_retries + 1):
+        try:
+            with gpu_memory_manager():
+                # 执行推理
+                with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                    result = pipe(
+                        reference_image=ref_image_path,
+                        audio_path=audio_path,
+                        pose_dir=pose_dir,
+                        video_length=infer_params["video_length"],
+                        num_inference_steps=infer_params["num_inference_steps"],
+                        guidance_scale=infer_params["guidance_scale"],
+                        height=infer_params["height"],
+                        width=infer_params["width"],
+                        generator=torch.Generator("cuda").manual_seed(config.get('seed', 42)),
+                        return_dict=True,
+                        callback_on_step_end=lambda step, timestep, latents: print(f"Step {step}/{infer_params['num_inference_steps']}", end='\r') if step % 5 == 0 else None
+                    )
+            
+            break  # 成功则跳出重试循环
+            
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"\n❌ GPU显存不足 (尝试 {attempt + 1}/{max_retries + 1}): {e}")
+            
+            if attempt < max_retries:
+                # 降级参数重试
+                print("🚨 使用降级参数重试...")
+                scale_factor = 0.7 ** (attempt + 1)  # 逐次降级
+                infer_params = {
+                    "video_length": max(int(infer_params["video_length"] * scale_factor), 6),
+                    "num_inference_steps": max(int(infer_params["num_inference_steps"] * scale_factor), 8),
+                    "guidance_scale": max(infer_params["guidance_scale"] * scale_factor, 1.0),
+                    "height": max(int(infer_params["height"] * scale_factor), 256),
+                    "width": max(int(infer_params["width"] * scale_factor), 256),
+                }
+                
+                print(f"📉 降级参数 (缩放因子: {scale_factor:.2f}):")
+                for key, value in infer_params.items():
+                    print(f"   {key}: {value}")
+                
+                torch.cuda.empty_cache()
+                gc.collect()
+                time.sleep(2)  # 等待内存释放
+            else:
+                raise
+        
+        except Exception as e:
+            print(f"\n❌ 推理失败: {e}")
+            if attempt < max_retries:
+                print("🔄 重试中...")
+                time.sleep(1)
+            else:
+                raise
+    
+    # 计算耗时
+    duration = time.time() - start_time
+    print(f"\n⏱️ 推理完成，耗时: {duration:.1f}秒 ({duration/60:.1f}分钟)")
+    print_gpu_memory("推理完成后")
+    
+    # 保存视频
+    timestamp = int(time.time())
+    output_path = output_dir / f"echomimic_output_{timestamp}.mp4"
+    
+    if hasattr(result, 'videos') and result.videos is not None:
+        save_videos_grid(result.videos, output_path, fps=config.get('output_fps', 25))
+        print(f"✅ 视频已保存: {output_path}")
+        
+        # 性能统计
+        fps = infer_params["video_length"] / duration
+        efficiency = audio_duration / duration
+        
+        print(f"📈 性能统计:")
+        print(f"   生成速度: {fps:.2f} 帧/秒")
+        print(f"   效率比: {efficiency:.3f} (音频秒数/生成秒数)")
+        
+        if duration < 180:  # 3分钟内
+            print("🎉 优化成功！生成时间在目标范围内")
+        elif duration < 300:  # 5分钟内
+            print("✅ 生成完成，时间可接受")
+        else:
+            print("⚠️ 生成时间较长，建议进一步优化参数")
+            
+        # 保存元数据
+        metadata = {
+            'audio_duration': audio_duration,
+            'generation_time': duration,
+            'parameters': infer_params,
+            'efficiency': efficiency,
+            'fps': fps
+        }
+        
+        metadata_path = output_dir / f"metadata_{timestamp}.yaml"
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            yaml.dump(metadata, f, default_flow_style=False, allow_unicode=True)
+        print(f"📝 元数据已保存: {metadata_path}")
+            
+    else:
+        print("❌ 推理结果为空，请检查输入文件")
+
+def main():
+    parser = argparse.ArgumentParser(description="EchoMimic优化推理")
+    parser.add_argument("--config", type=str, default="./configs/prompts/infer.yaml",
+                       help="配置文件路径")
+    parser.add_argument("--verbose", action="store_true",
+                       help="详细输出")
+    
+    args = parser.parse_args()
+    
+    print("🚀 EchoMimic V2 增强优化版推理启动")
+    print("🎯 针对RTX 4000 Ada 12GB深度优化")
+    print("⏱️ 目标：5秒音频2-3分钟完成")
+    print("-" * 50)
+    
+    if args.verbose:
+        print_system_info()
+        print("-" * 50)
+    
+    try:
+        # 检查CUDA
+        if not torch.cuda.is_available():
+            raise RuntimeError("❌ CUDA不可用，请检查GPU驱动")
+        
+        # 重置GPU内存统计
+        torch.cuda.reset_peak_memory_stats()
+        
+        # 加载配置
+        config = load_config(args.config)
+        
+        # 初始化管道
+        pipe = initialize_pipeline(config)
+        
+        # 执行推理
+        run_inference(pipe, config)
+        
+        print("\n🎉 任务完成！")
+        
+        if args.verbose:
+            print("-" * 30)
+            print_system_info()
+        
+    except KeyboardInterrupt:
+        print("\n🛑 用户中断")
+        sys.exit(0)
+    except Exception as e:
+        print(f"❌ 执行失败: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+    finally:
+        # 清理资源
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+if __name__ == "__main__":
+    main()
